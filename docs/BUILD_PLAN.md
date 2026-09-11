@@ -7,6 +7,14 @@ Where this plan disagrees with the spec, the disagreement is called out explicit
 **Repo state at time of writing:** empty. `LICENSE` (MIT ✅ satisfies §3.1), `README.md` stub,
 Python `.gitignore`. Nothing else exists.
 
+> **Revision (2026-09-11, post-review):** four items below reflect owner calls made after the first
+> pass of this plan. **G2** (test corpus) is deprioritized — not needed to start building, only to
+> validate M3, so it no longer blocks Phase 0. **G4** (installer size) is resolved — the size budget
+> was relaxed to <5 GB, which removes the forcing function for INT8 quantization entirely. **G1**
+> (reference hardware) got a partial, evidence-based answer from a real (if limited) CI-style sandbox
+> — see the update inside G1. **G16** was corrected after actually running the numbers instead of
+> estimating them; the claimed win was smaller than stated, and running it surfaced a real bug.
+
 ---
 
 ## 1. How to read this
@@ -40,6 +48,24 @@ The spec quotes "a 4-core desktop" in §7.1 but never names target hardware, whi
 | Floor | 2c/4t laptop, iGPU | 8 GB | SATA SSD | N-5 RAM ceiling, N-4 cold start |
 
 Every perf number in the repo cites a tier. No tier, no number.
+
+> **What a disposable cloud sandbox can and can't tell you.** Tried this against a throwaway Linux
+> container (4 vCPU, shared/virtualized, no GPU, virtualized block storage) to see how far a sandbox
+> substitutes for a named machine. Two results:
+> - A synthetic ONNX graph FLOP-matched to ViT-B/32's ~4.4 GFLOPs/image reported ~60,000 img/s under
+>   `onnxruntime`. That number is meaningless — a single dense matmul hits a far higher fraction of
+>   peak FLOPs than a real 12-layer transformer's actual op mix (attention, layernorm, many small
+>   matmuls) ever does. **FLOP count alone is not a valid throughput proxy; only the real exported
+>   ONNX graph gives trustworthy numbers** (P0.3).
+> - What *did* transfer: portable, architecture-independent behavior like JPEG decode strategy
+>   (§7.3.1, G16 below) can be measured anywhere Python runs.
+> - What can't transfer at all: anything Windows-only (DirectML, `SetThreadExecutionState`, WMI
+>   drive-type detection), and anything depending on real storage hardware — a virtualized cloud disk
+>   has neither a real HDD's seek penalty nor a real SSD's queue depth behavior.
+>
+> Net: a sandbox is useful for catching methodology mistakes before they reach real hardware, and for
+> validating logic that doesn't depend on the OS or the disk. It is not a substitute for P0.1's named
+> machines, particularly for §7.2's HDD/SSD read strategy and §7.3.6's DirectML measurement.
 
 ### P0.2 — Acquire the test corpus (longest lead item in the project)
 
@@ -225,8 +251,8 @@ PyInstaller `--onedir` + Inno Setup, per-user install, x64 only. Signing certifi
 be in hand from M1.15. VirusTotal submission and false-positive reports (§11.3). Clean-VM test with
 no Python present and networking disabled.
 
-**Watch item:** N-6 (< 250 MB installer). See G4 — this is the requirement most likely to fail, and
-it fails at M6 unless the INT8 decision was made back in M0.
+**Note:** N-6's original < 250 MB target has been relaxed to < 5 GB (owner decision, see G4), which
+fp32 or fp16 weights clear comfortably. This is no longer a watch item.
 
 ---
 
@@ -297,32 +323,51 @@ What the spec does not cover, ranked by when it bites. IDs are stable; reference
 §7.1 says "a 4-core desktop"; N-2 says "≥1.7 img/s, target ≥6". With no named machine, N-2 cannot
 pass or fail. → P0.1.
 
+*Update (2026-09-11):* tested how far a disposable cloud sandbox substitutes for this. It can catch
+methodology mistakes (see the FLOP-proxy finding in P0.1) and validate OS-independent logic (see
+G16's decode finding below), but cannot stand in for P0.1 itself — no Windows, no DirectML, no real
+HDD/SSD I/O characteristics, shared/virtualized CPU. P0.1 still needs to happen on named, real
+hardware.
+
 **G2 — The test corpus does not exist and has the longest lead time in the project.**
 §12.4 asks for a real 50k library "early" and §12.1 for a labeled set, but neither is a milestone
 deliverable and neither has an owner or a source. The face corpus in particular (repeat identities,
 consumer conditions, ethically sourced) is the hard one, and it gates M3 and every threshold number
-in §5.3. → P0.2. **Most likely item to silently slip.**
+in §5.3. → P0.2.
+
+*Status (2026-09-11): deprioritized by owner decision.* Testable locally against a personal library
+as the project matures rather than sourced up front; the project doesn't need to be accuracy-perfect
+from the start. Demoted out of the Phase 0 blocking set — it still gates M3's threshold work and the
+labeled accuracy set in §12.1, so it isn't gone, just no longer on the critical path to starting.
 
 **G3 — Producing the ONNX artifacts is unplanned work.**
 The spec treats "OpenCLIP ViT-B/32, ONNX" as a given. In practice: two exported graphs (image
 *and* text towers), a CLIP BPE tokenizer implemented without `transformers` (which §9.5 requires
 you to defang anyway), a parity check against reference PyTorch, and checksums for §9.3. → P0.3.
 
-**G4 — N-6 (installer < 250 MB) is unreachable without INT8 quantization, which the spec never mentions.**
+**G4 — N-6 (installer < 250 MB) was unreachable without INT8 quantization, which the spec never mentioned.**
 OpenCLIP ViT-B/32 is ~151M params across both towers:
 
-| Precision | Models on disk | + runtime (Python, Qt, ORT, NumPy, Pillow) | Verdict vs. N-6 |
+| Precision | Models on disk | + runtime (Python, Qt, ORT, NumPy, Pillow) | Verdict vs. original N-6 (250 MB) |
 |---|---|---|---|
 | fp32 | ~605 MB | ~755 MB | impossible |
 | fp16 | ~302 MB | ~450 MB | fails |
-| **int8 dynamic** | **~155 MB** | ~340 MB uncompressed → ~200–250 MB installer | **tight but plausible** |
+| int8 dynamic | ~155 MB | ~340 MB uncompressed → ~200–250 MB installer | tight but plausible |
 
 (SFace adds 37 MB, YuNet 0.34 MB, concept matrix 1.6 MB in all cases.)
 
-So a **size** requirement silently forces an **ML** decision, whose accuracy cost must be validated
-against corpus C. INT8 also plausibly doubles CPU throughput, which is the cheapest path to N-2's
-≥6 img/s target — the same lever solves both. Quantization belongs in M0's exit criteria, and
-`model_version` must record it. Either that, or relax N-6 to ~400 MB now rather than at M6.
+*Status (2026-09-11): RESOLVED by owner decision — N-6 relaxed from < 250 MB to < 5 GB.* This removes
+the forcing function entirely: fp32 (~755 MB installed) and fp16 (~450 MB installed) both clear the
+new budget with room to spare, even alongside the optional non-commercial `buffalo_l` face model or
+a larger CLIP variant.
+
+**Revised recommendation:** default to **fp16** — it halves size and RAM versus fp32 at negligible
+accuracy cost, with no real downside, so there's no reason not to take it. **INT8 downgrades from a
+size requirement to a throughput experiment.** It's still worth measuring in M0 (it plausibly doubles
+CPU throughput, the cheapest path to N-2's ≥6 img/s target), but it no longer gates whether the app
+can ship, and no longer needs an accuracy validation pass before a decision can be made either way.
+`model_version` must still record precision (`clip-vitb32-laion2b-fp16-v1`, etc.) — an fp16-indexed
+and int8-indexed library remain non-interchangeable regardless of which is the default.
 
 ### 6.2 Structural — decide at M1, expensive afterwards
 
@@ -384,12 +429,32 @@ intermediates — realistically 30–90 s on the primary tier. Fine as a job; wr
 Give it a progress bar and a cancel. Also, the block size must be ~1024 rows, not 4096, to respect
 N-5's 3 GB ceiling.
 
-**G16 — `Image.draft()` is a simpler and more reliable version of §7.3.1.**
+**G16 — `Image.draft()` is a simpler version of §7.3.1, but "no correctness caveats" was wrong — it has one, and the win is smaller than claimed.**
 Extracting the embedded EXIF preview means handling missing previews, mismatched orientation,
 different crops, and a "is it big enough for face detection" rule. Pillow's `draft()` does DCT-domain
-JPEG downscaling to 1/2, 1/4, or 1/8 during decode, in three lines, with no correctness caveats, for
-a similar win. Make `draft()` primary and keep preview extraction as an optimization only if M0
-shows it is meaningfully faster.
+JPEG downscaling to 1/2, 1/4, or 1/8 during decode, which avoided those caveats on paper.
+
+*Update (2026-09-11): measured instead of estimated, and it surfaced a real bug.* `draft()` requires
+**both** scaled dimensions to meet the requested target. Calling `im.draft("RGB", (1600, 1600))` — a
+square target, the natural way to write it — against a 4032×3024 (4:3) source silently returns the
+full-size image with **zero speedup**: 1/2 scale gives 2016×1512, and 1512 < 1600 fails the check, so
+`draft()` declines to scale at all. No error, no warning. The fix is to scale the target by the
+image's own long edge:
+
+```python
+scale = long_edge / max(im.size)
+im.draft("RGB", (int(im.width * scale), int(im.height * scale)))
+```
+
+Once fixed, measured speedups (synthetic 4032×3024 JPEG, random-noise pixel content) were **1.17×–1.34×**
+across 1/2 to 1/8 scale — well short of the "similar win" this gap originally claimed. Random noise is
+close to a worst case for JPEG (near-incompressible, so entropy decode dominates regardless of output
+scale); real photographic content, being far more compressible, should show a larger win since the
+IDCT/upsample stage `draft()` actually shrinks is proportionally more of total decode time — but that
+needs a real photo corpus to confirm (→ G2), and is exactly the kind of "estimated, not measured" trap
+§7.1 already warns about. Keep `draft()` as the M0 candidate — it is still simpler than preview
+extraction and the win is real — but validate the actual speedup and ship the aspect-ratio-correct
+helper above rather than the naive call.
 
 ### 6.4 Legal and distribution
 
@@ -423,7 +488,7 @@ Focused-work weeks, solo, for a developer comfortable with Python but new to ONN
 
 | Phase | Weeks | Risk |
 |---|---|---|
-| Phase 0 | 1–2 | Corpus B sourcing can dominate (G2) |
+| Phase 0 | 1–2 | Corpus B (G2) deprioritized — still needed by M3, no longer gates Phase 0 |
 | M0 | 1–2 | Low — throwaway by design |
 | M1 | 4–6 | Medium — carries the structural decisions |
 | M2 | 3–4 | Medium — concept curation (Q13) is open-ended |
@@ -446,13 +511,13 @@ Extending §14's Q13–Q18.
 
 | # | Question | Decide by |
 |---|---|---|
-| Q19 | INT8 vs fp16 CLIP — what is the accuracy cost, and is it acceptable to meet N-6? (Couples to Q14 and G4.) | M0 |
-| Q20 | Where does face corpus B come from, and under what consent? (G2) | Phase 0 |
+| Q19 | INT8 vs fp16 CLIP — now a throughput-only question (N-6 relaxed, see G4): is INT8's speedup worth its accuracy cost, given fp16 already fits the size budget? | M0 |
+| Q20 | Where does face corpus B come from, and under what consent? (G2 — deprioritized, decide whenever M3 approaches) | M3 |
 | Q21 | Thumbnail store: sharded files on disk, or blobs in SQLite? (G9) | M1 |
 | Q22 | Do sidebar counts follow the F-2.3 threshold slider, or use a fixed per-concept calibration? (G14) | M2 |
 | Q23 | On re-scan, what is shown for photos whose files are gone — and how is that distinguished from an unplugged drive? (G5) | M1 |
 | Q24 | Does the M1 CLI become a supported user-facing surface, or stay an internal test harness? (Q18's follow-on) | M5 |
-| Q25 | If N-6 cannot be met at INT8, relax the size target or drop to a smaller CLIP variant? | M0 |
+| ~~Q25~~ | ~~If N-6 cannot be met at INT8, relax the size target or drop to a smaller CLIP variant?~~ **Resolved 2026-09-11** — N-6 relaxed to < 5 GB; fp16 clears it without quantization. | — |
 
 ---
 
